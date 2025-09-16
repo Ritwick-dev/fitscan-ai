@@ -1,0 +1,8 @@
+badge_name,rule
+First 10 Squats,reps>=10
+Consistency King,streak>=3
+Above Average,user_reps>avg_reps
+Endurance Hero,reps>=50
+Daily Starter,logged_days>=1
+Pushup Pro,pushup_reps>=30
+Perfect Form,good_reps_percent>=90
