@@ -1,12 +1,12 @@
 # exercise_logic.py
-# Simple squat-angle calculator, smoother, and counter.
-# Safe for beginners: guarded against divide-by-zero and missing keypoints.
+# Squat counter with knee angle calculation, smoother, and form checks.
+# Beginner-friendly, safe fallbacks, and clear comments.
 
 import math
 from typing import Tuple, Dict, Any, Optional
 
 # -----------------------
-# Angle computation
+# Angle computation (dot-product)
 # -----------------------
 def compute_angle(a, b, c) -> float:
     """
@@ -21,7 +21,6 @@ def compute_angle(a, b, c) -> float:
     except Exception:
         return 180.0
 
-    # vectors BA (A - B) and BC (C - B)
     bax, bay = ax - bx, ay - by
     bcx, bcy = cx - bx, cy - by
 
@@ -32,11 +31,33 @@ def compute_angle(a, b, c) -> float:
 
     dot = bax * bcx + bay * bcy
     cos_angle = dot / (norm1 * norm2)
-
-    # clamp for numerical safety
     cos_angle = max(-1.0, min(1.0, cos_angle))
     angle_rad = math.acos(cos_angle)
     return math.degrees(angle_rad)
+
+
+# -----------------------
+# Angle computation (atan2 method)
+# -----------------------
+def calculate_angle(a: Tuple[float, float],
+                    b: Tuple[float, float],
+                    c: Tuple[float, float]) -> Optional[float]:
+    """
+    a, b, c are (x,y) tuples.
+    Returns angle at point b in degrees (0..180).
+    Uses atan2 method and guards errors.
+    """
+    try:
+        ang = math.degrees(
+            math.atan2(c[1] - b[1], c[0] - b[0]) -
+            math.atan2(a[1] - b[1], a[0] - b[0])
+        )
+        ang = abs(ang)
+        if ang > 180:
+            ang = 360 - ang
+        return ang
+    except Exception:
+        return None
 
 
 # -----------------------
@@ -52,7 +73,6 @@ class ExponentialSmoother:
     def update(self, x: float) -> float:
         """Feed a new scalar x. Returns smoothed value."""
         if x is None:
-            # if nothing new, return last value or a safe default
             return self.value if self.value is not None else 180.0
         if self.value is None:
             self.value = float(x)
@@ -71,6 +91,7 @@ class SquatCounter:
       - Counts when DOWN (<= th_down) -> UP (>= th_up).
       - Debounces with min_frames_between.
       - Uses min_conf to require keypoint confidence.
+      - Emits form flags: "go_lower", "depth_ok", "low_confidence", "too_fast"
     """
 
     def __init__(self,
@@ -103,43 +124,47 @@ class SquatCounter:
         self.frame = 0
         self.min_angle_since_up = 180.0
 
-    def _angle_and_conf_from_keypoints(self, keypoints: Dict[str, Tuple[float, ...]]) -> Tuple[Optional[float], Optional[float]]:
+    def update(self, keypoints: Dict[str, Tuple[float, ...]]) -> Dict[str, Any]:
         """
-        keypoints: dict with keys like 'left_hip', 'left_knee', 'left_ankle', same for 'right_'.
-        Each value: (x, y, conf) or (x, y).
-        Returns: (angle_degrees or None, confidence or None).
-        Chooses the valid side with the smallest (deepest) angle.
+        Main per-frame call using keypoints dict from AI Person.
+        Grabs left & right leg angles, uses smaller one, and updates counter.
+        Expected keypoints format:
+          { "left_hip":(x,y,conf), "left_knee":(x,y,conf), "left_ankle":(x,y,conf),
+            "right_hip":..., "right_knee":..., "right_ankle":... }
         """
-        candidates = []
+        angles = []
+
         for side in ("left", "right"):
             hip = keypoints.get(f"{side}_hip")
             knee = keypoints.get(f"{side}_knee")
             ankle = keypoints.get(f"{side}_ankle")
-            if hip is None or knee is None or ankle is None:
-                continue
-            # confidences if present
-            hconf = hip[2] if len(hip) > 2 else 1.0
-            kconf = knee[2] if len(knee) > 2 else 1.0
-            aconf = ankle[2] if len(ankle) > 2 else 1.0
-            side_conf = min(hconf, kconf, aconf)
-            if side_conf < self.min_conf:
-                continue
-            angle = compute_angle(hip, knee, ankle)
-            candidates.append((angle, side_conf))
 
-        if not candidates:
-            return None, None
+            if hip and knee and ankle:
+                # confidences (fallback 1.0 if missing)
+                hconf = hip[2] if len(hip) > 2 else 1.0
+                kconf = knee[2] if len(knee) > 2 else 1.0
+                aconf = ankle[2] if len(ankle) > 2 else 1.0
+                conf = min(hconf, kconf, aconf)
 
-        # choose the smallest angle (deepest knee)
-        best = min(candidates, key=lambda x: x[0])
-        return best[0], best[1]
+                if conf >= self.min_conf:
+                    # use calculate_angle on (x,y) pairs
+                    ang = calculate_angle((hip[0], hip[1]),
+                                          (knee[0], knee[1]),
+                                          (ankle[0], ankle[1]))
+                    if ang is not None:
+                        angles.append((ang, conf))
 
-    def update(self, keypoints: Dict[str, Tuple[float, ...]]) -> Dict[str, Any]:
-        """
-        Main per-frame call using keypoints dict from AI Person.
-        Returns status dict with reps, state, knee_angle, form_flags.
-        """
-        angle, conf = self._angle_and_conf_from_keypoints(keypoints)
+        if not angles:
+            # No reliable legs found
+            return {
+                "reps": self.reps,
+                "state": self.state,
+                "knee_angle": None,
+                "form_flags": ["low_confidence"]
+            }
+
+        # choose the smaller angle (deeper squat)
+        angle, conf = min(angles, key=lambda x: x[0])
         return self.update_with_angle(angle, conf)
 
     def update_with_angle(self, angle: Optional[float], conf: Optional[float]) -> Dict[str, Any]:
@@ -173,18 +198,26 @@ class SquatCounter:
                 self.state = "DOWN"
                 self.depth_reached = True
         else:  # currently DOWN
+            # Provide live form feedback while down
+            if smooth_angle > 100:
+                flags.append("go_lower")
+            else:
+                flags.append("depth_ok")
+
+            # Check if returned to standing
             if smooth_angle >= self.th_up:
                 # returned to standing
                 if self.depth_reached:
                     # only count if debounce passed
                     if (self.frame - self.last_rep_frame) >= self.min_frames_between:
                         self.reps += 1
-                        flags.append("depth_ok")
+                        # depth_ok already added while down; keep as coach feedback
                         self.last_rep_frame = self.frame
                     else:
                         flags.append("too_fast")
                 else:
                     flags.append("go_lower")
+
                 # reset cycle
                 self.state = "UP"
                 self.depth_reached = False
